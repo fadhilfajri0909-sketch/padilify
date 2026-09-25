@@ -77,6 +77,31 @@ async function searchYouTube(q) {
   return null;
 }
 
+// Pilih format audio PALING KOMPATIBEL (M4A > MP4 > OPUS)
+function pickBestAudio(downloads) {
+  const audioFormats = downloads.filter(d => d.type === 'audio');
+  if (!audioFormats.length) return downloads[0] || null;
+  
+  // 1. Prioritas M4A 128kbps — paling kompatibel
+  let best = audioFormats.find(f => f.format === 'M4A' && f.quality === '128KBPS');
+  if (best) return best;
+  
+  // 2. M4A apa aja
+  best = audioFormats.find(f => f.format === 'M4A');
+  if (best) return best;
+  
+  // 3. MP4 (kadang audio ada di MP4)
+  best = audioFormats.find(f => f.format === 'MP4');
+  if (best) return best;
+  
+  // 4. OPUS 256 (kualitas bagus, tapi Chrome HP kadang gak jalan)
+  best = audioFormats.find(f => f.format === 'OPUS' && f.quality === '256KBPS');
+  if (best) return best;
+  
+  // 5. Format apapun
+  return audioFormats[0];
+}
+
 async function downloadYouTube(videoId) {
   try {
     const res = await fetchInsecure('https://api.alwayscodex.eu.cc/api/downloader/youtubev2', {
@@ -85,18 +110,19 @@ async function downloadYouTube(videoId) {
       body: JSON.stringify({ url: 'https://www.youtube.com/watch?v=' + videoId })
     });
     const data = JSON.parse(res.body);
+    console.log('YT response status:', data.status);
+    
     if (data.status && data.result && data.result.downloads) {
-      const audioFormats = data.result.downloads.filter(d => d.type === 'audio');
-      let best = audioFormats.find(f => f.quality === '128KBPS' && f.format === 'M4A');
-      if (!best) best = audioFormats.find(f => f.format === 'M4A');
-      if (!best) best = audioFormats.find(f => f.format === 'MP4');
-      if (!best) best = audioFormats[0];
+      const best = pickBestAudio(data.result.downloads);
+      console.log('Picked format:', best ? best.format : 'none', best ? best.quality : '');
       if (best && best.download_url) {
         return {
           stream_url: best.download_url,
           title: data.result.title,
           thumbnail: data.result.thumbnail,
-          duration: data.result.duration
+          duration: data.result.duration,
+          format: best.format,
+          quality: best.quality
         };
       }
     }
