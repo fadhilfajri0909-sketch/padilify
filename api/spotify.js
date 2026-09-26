@@ -14,28 +14,6 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
   }
 }
 
-async function fetchInsecure(url, options) {
-  return new Promise((resolve, reject) => {
-    const u = new URL(url);
-    const req = https.request({
-      hostname: u.hostname,
-      path: u.pathname + u.search,
-      method: options.method || 'GET',
-      headers: options.headers || {},
-      agent: agent,
-      timeout: 20000
-    }, (res) => {
-      let body = '';
-      res.on('data', c => body += c);
-      res.on('end', () => resolve({ status: res.statusCode, body }));
-    });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
-    if (options.body) req.write(options.body);
-    req.end();
-  });
-}
-
 // ========== SEARCH via Piped ==========
 const PIPED_INSTANCES = [
   'https://pipedapi.kavin.rocks',
@@ -69,35 +47,77 @@ async function searchYouTube(q) {
   return null;
 }
 
-// ========== GET STREAM via alwayscodex ==========
-async function getStreamUrl(videoId) {
+// ========== YTMP3 via convert1s.com ==========
+async function getYtmp3(videoId) {
+  const ytUrl = 'https://www.youtube.com/watch?v=' + videoId;
+  const headers = {
+    'accept': 'application/json',
+    'content-type': 'application/json',
+    'origin': 'https://ssvid.cc',
+    'referer': 'https://ssvid.cc/',
+    'user-agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36'
+  };
+
   try {
-    console.log('alwayscodex:', videoId);
-    const res = await fetchInsecure('https://api.alwayscodex.eu.cc/api/downloader/youtubev2', {
+    // Step 1: Init — POST ke convert1s
+    console.log('Init ytmp3:', videoId);
+    const initRes = await fetchWithTimeout('https://hub.convert1s.com/api/download', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
-      body: JSON.stringify({ url: 'https://www.youtube.com/watch?v=' + videoId })
-    });
-    console.log('status:', res.status);
-    const data = JSON.parse(res.body);
-    console.log('data status:', data.status);
-    
-    if (data.status && data.result && data.result.downloads) {
-      const audio = data.result.downloads.filter(d => d.type === 'audio');
-      let best = audio.find(f => f.format === 'M4A' && f.quality === '128KBPS')
-              || audio.find(f => f.format === 'M4A')
-              || audio.find(f => f.format === 'MP4')
-              || audio.find(f => f.format === 'OPUS' && f.quality === '256KBPS')
-              || audio[0];
-      if (best && best.download_url) {
-        console.log('OK:', best.format, best.quality);
-        return best.download_url;
-      }
+      headers: headers,
+      body: JSON.stringify({
+        url: ytUrl,
+        audio: { bitrate: '128k' },
+        output: { type: 'audio', format: 'mp3' }
+      })
+    }, 20000);
+
+    if (!initRes.ok) {
+      console.log('Init HTTP:', initRes.status);
+      return null;
     }
+
+    const initData = await initRes.json();
+    console.log('Init data:', JSON.stringify(initData).slice(0, 200));
+    
+    const statusUrl = initData.statusUrl;
+    if (!statusUrl) {
+      console.log('No statusUrl');
+      return null;
+    }
+
+    // Step 2: Poll statusUrl
+    let attempts = 0;
+    while (attempts < 20) {
+      await new Promise(r => setTimeout(r, 1500));
+      try {
+        const statusRes = await fetchWithTimeout(statusUrl, {
+          headers: headers
+        }, 15000);
+        if (!statusRes.ok) { attempts++; continue; }
+        
+        const statusData = await statusRes.json();
+        console.log('Poll', attempts, ':', statusData.status);
+        
+        if (statusData.status === 'completed') {
+          return {
+            stream_url: statusData.downloadUrl,
+            title: statusData.title || initData.title,
+            duration: statusData.duration || initData.duration
+          };
+        }
+        if (statusData.status === 'error' || statusData.status === 'failed') {
+          return null;
+        }
+      } catch(e) {
+        console.log('Poll err:', e.message);
+      }
+      attempts++;
+    }
+    return null;
   } catch(e) {
-    console.error('alwayscodex error:', e.message);
+    console.error('ytmp3 error:', e.message);
+    return null;
   }
-  return null;
 }
 
 // ========== HANDLER ==========
@@ -116,54 +136,26 @@ module.exports = async function handler(req, res) {
     return res.status(404).json({ status: false, message: 'Tidak ada hasil' });
   }
 
-  // ===== STREAM PROXY =====
+  // ===== GET STREAM URL (return JSON, bukan proxy) =====
   if (req.method === 'GET' && req.query.stream) {
     const videoId = req.query.stream;
-    const streamUrl = await getStreamUrl(videoId);
+    const result = await getYtmp3(videoId);
     
-    if (!streamUrl) {
+    if (!result || !result.stream_url) {
       return res.status(404).json({ status: false, message: 'Stream tidak ditemukan' });
     }
     
-    // Proxy audio ke browser
-    try {
-      const headers = { 'User-Agent': 'Mozilla/5.0' };
-      if (req.headers.range) headers['Range'] = req.headers.range;
-      
-      const audioRes = await fetch(streamUrl, { headers, redirect: 'follow' });
-      if (!audioRes.ok) {
-        return res.status(500).json({ status: false, message: 'Gagal fetch audio: ' + audioRes.status });
+    return res.status(200).json({
+      status: true,
+      data: {
+        stream_url: result.stream_url,
+        title: result.title,
+        duration: result.duration
       }
-      
-      res.setHeader('Content-Type', audioRes.headers.get('content-type') || 'audio/mp4');
-      res.setHeader('Accept-Ranges', 'bytes');
-      if (audioRes.headers.get('content-length')) {
-        res.setHeader('Content-Length', audioRes.headers.get('content-length'));
-      }
-      if (audioRes.headers.get('content-range')) {
-        res.setHeader('Content-Range', audioRes.headers.get('content-range'));
-        res.status(206);
-      } else {
-        res.status(200);
-      }
-      
-      const reader = audioRes.body.getReader();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        res.write(Buffer.from(value));
-      }
-      res.end();
-    } catch(e) {
-      console.error('Proxy error:', e.message);
-      if (!res.headersSent) {
-        return res.status(500).json({ status: false, message: e.message });
-      }
-    }
-    return;
+    });
   }
 
-  // ===== POST =====
+  // ===== POST — return URL proxy =====
   if (req.method === 'POST') {
     const { videoId } = req.body || {};
     if (!videoId) return res.status(400).json({ status: false, message: 'videoId required' });
